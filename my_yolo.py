@@ -61,4 +61,89 @@ class Detect(nn.Model):
                 z.append(y.view(bs, -1, self.no))
         return x if self.training else (torch.cat(z, 1), x)
     @staticmethod
-    def
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+class Model(nn.Module):
+    def __init__(self, cfg = 'yolov5s.yaml', ch = 3, nc = None, anchors = None):#model , input channels, number 0f class
+        super().__init__()
+        if isinstance(cfg, dict):
+            self.yaml = cfg #model dict
+        else:
+            import yaml
+            self.yaml_file = Path(cfg).name
+            with open(cfg, errors='ignore') as f:
+                self.yaml = yaml.safe_load(f)#model dict
+
+        #define model
+        ch = self.yaml['ch'] = self.yaml.get('ch', ch)#input channels
+        if nc and nc !=self.yaml['nc']:
+            LOGGER.info(f"Overriding model.ymal nc={self.yaml['nc']}with nc={nc} ")
+            self.yaml['nc'] = nc
+        if anchors:
+            LOGGER.info(f'Overriding model.ymal anchors with anchors = {anchors}')
+            self.yaml['anchors'] = round(anchors)#override yaml value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch]) #model savelist
+        self.names = [str(i) for i in range(self.yaml['nc'])] #defalut name
+        self.inplace = self.yaml.get('inplace', True)
+
+        #build stides , anchors
+        m = self.model[-1] #Detect
+        if isinstance(m, Detect):
+            s = 256 #2x min stride
+            m.inplace = self.inplace
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))]) #forward
+            m.anchors /= m.stride.view(-1, 1, 1)
+            check_anchor_order(m)
+            self.stride = m.stride
+            self._initialize_biases() #only run once
+
+        #init weights biase
+        initialize_weights(self)
+        self.info()
+        LOGGER.info('')
+    def forward(self, x, augment=False, profile=False, visualize=False):
+        if augment:
+            return self._forward_augment(x)
+        return self._forward_once(x, profile, visualize)
+    def _forward_agument(self, x):
+        img_size = x.shape[-2:] #height width
+        s = [1, 0.83, 0.67] #scales
+        f = [None, 3, None]
+        y = []
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = self._forward_once(xi)[0] #forward
+            #cv2.imwrite
+            yi = self._descale_pred(yi, fi, xi, img_size)
+            y.append(yi)
+        y = self._clip_augmented(y) #clip augmented tails
+        return torch.cat(y, 1), None
+    def _forward_once(self, x, profile=False, visualize=False):
+        y, dt = [], []
+        for m in self.model:
+            if m.f != -1: #if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j==-1 else y[j] for j in m.f]#from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x
+    def _descale_pred(self, p, flips, scale, img_size):
+        if self.inplace:
+            p[..., :4] /= scale
+            if flips ==2 :
+                p[..., :1] = img_size[0] - p[..., 1]
+            elif flips == 3:
+                p[..., 0] = img_size[1] - p[..., 0]
+        else:
+            x, y, wh = p[..., 0:1]/scale, p[..., 1:2]/scale, p[..., 2:4]/scale
+            if flips == 2:
+                y = img_size[0] - y
+            elif flips ==3:
+                x = img_size[1] - x
+            p = torch.cat((x, y, wh, p[..., 4:]), -1)
+        return p
